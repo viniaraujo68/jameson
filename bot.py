@@ -34,14 +34,14 @@ DATA.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- CONFIG ----
 TZ = ZoneInfo("America/Sao_Paulo")
-QUIET_HOURS = (23, 7)          # sem envio das 23h às 7h (o que sair à noite é avaliado às 7h)
+QUIET_HOURS = (20, 9)          # sem envio das 20h às 9h (o que sair à noite é avaliado às 9h)
 MIN_SCORE = 7                  # o modelo devolve só nota >= 7 (escala 1-10)
 ALWAYS_SCORE = 9               # nota >= 9 passa por cima do ritmo e dos tetos de categoria
 MAX_PER_RUN = 7                # teto de mensagens por execução (evita enxurrada); execuções são de hora em hora
 TOTAL_DAILY_CAP = 18           # teto diário para notas 7-8 (nota 8: +2); nota 9-10 vai até HARD_DAILY_CAP
 HARD_DAILY_CAP = 25
 DAILY_CAPS = {"Brasil": 4, "Mundo": 4, "Política": 4, "Mercado": 3, "Tecnologia": 3, "Esportes": 3}
-MORNING_ALLOWANCE = 0.3        # fração do dia já "liberada" às 7h (notícias da madrugada)
+MORNING_ALLOWANCE = 0.3        # fração do dia já "liberada" às 9h (notícias da madrugada)
 MAX_AGE_HOURS = 14             # ignora itens mais velhos que isso
 FIRST_RUN_AGE_HOURS = 3        # no primeiro uso, só olha as últimas horas (evita flood)
 PER_SOURCE_PER_RUN = 8
