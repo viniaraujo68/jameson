@@ -29,6 +29,8 @@ from pydantic_ai import Agent, ModelRetry, RunContext
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
+DATA = Path(os.environ.get("DATA_DIR") or BASE)  # onde ficam estado e logs (volume no Docker)
+DATA.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- CONFIG ----
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -108,7 +110,7 @@ SOURCES = [
 ]
 # --------------------------------------------------------------------------
 
-STATE_FILE = BASE / "state.json"
+STATE_FILE = DATA / "state.json"
 UA = "Mozilla/5.0 (compatible; jameson-news-bot/1.0)"
 log = logging.getLogger("jameson")
 
@@ -520,7 +522,7 @@ def handle_vote(st, cq):
         if data.startswith(("v1:", "v0:")):
             vote, h = int(data[1]), data[3:]
             meta = st.get("meta", {}).get(h, {})
-            with open(BASE / "feedback.jsonl", "a", encoding="utf-8") as f:
+            with open(DATA / "feedback.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({**meta, "ts_envio": meta.get("ts"), "ts": int(time.time()),
                                     "chat": msg.get("chat", {}).get("id"), "voto": vote}, ensure_ascii=False) + "\n")
             label = "👍 anotado" if vote else "👎 anotado"
@@ -625,7 +627,7 @@ def run(dry=False, force=False, model=None):
 
     if not dry:                            # diário de decisões: base para calibrar notas com dados reais
         sent_ids = {p.id for p in send}
-        with open(BASE / "picks.jsonl", "a", encoding="utf-8") as f:
+        with open(DATA / "picks.jsonl", "a", encoding="utf-8") as f:
             for p in picks:
                 f.write(json.dumps({"ts": int(time.time()), "fonte": items[p.id]["source"], "categoria": p.categoria,
                                     "nota": p.nota, "enviada": p.id in sent_ids, "adiada": p in defer,
@@ -668,7 +670,7 @@ def main():
     from logging.handlers import RotatingFileHandler
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.StreamHandler(),
-                                  RotatingFileHandler(BASE / "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")])
+                                  RotatingFileHandler(DATA / "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")])
     if args.register:
         st = load_state()
         process_updates(st)

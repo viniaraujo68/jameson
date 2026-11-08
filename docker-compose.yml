@@ -1,0 +1,9 @@
+services:
+  jameson:
+    build: .
+    profiles: ["cron"]
+    env_file: .env
+    volumes:
+      - jameson_data:/data
+volumes:
+  jameson_data:
