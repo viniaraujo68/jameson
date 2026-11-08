@@ -661,7 +661,7 @@ def run(dry=False, force=False, model=None):
     return sent_msgs
 
 
-BALANCE_ALERT_USD = float(os.environ.get("BALANCE_ALERT_USD", "0.30"))  # avisa o dono quando o saldo DeepSeek cair abaixo disso
+BALANCE_ALERT_USD = float(os.environ.get("BALANCE_ALERT_USD", "0.05"))  # avisa o dono quando o saldo DeepSeek cair abaixo disso
 
 
 def check_balance(st):
