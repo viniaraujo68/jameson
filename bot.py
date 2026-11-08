@@ -34,7 +34,7 @@ DATA.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- CONFIG ----
 TZ = ZoneInfo("America/Sao_Paulo")
-QUIET_HOURS = (20, 9)          # sem envio das 20h às 9h (o que sair à noite é avaliado às 9h)
+QUIET_HOURS = (21, 9)          # sem envio das 21h às 9h (a última rodada com envio é a das 20h)
 MIN_SCORE = 7                  # o modelo devolve só nota >= 7 (escala 1-10)
 ALWAYS_SCORE = 9               # nota >= 9 passa por cima do ritmo e dos tetos de categoria
 MAX_PER_RUN = 7                # teto de mensagens por execução (evita enxurrada); execuções são de hora em hora

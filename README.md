@@ -7,7 +7,7 @@ mundo, Brasil, política, mercado, tecnologia, esportes), um LLM dá nota 1–10
 Cada alerta = 1 mensagem: manchete em negrito + contexto + link da fonte. Dois passos: (1) o LLM escolhe e dá nota
 com título+trecho do feed; (2) para quem vai ser enviado, o bot lê a matéria e reescreve manchete/contexto com o texto
 completo (se a página não abrir, vale o rascunho do passo 1). Desdobramentos de uma história já enviada saem com
-"🔁 atualização". Sob cada mensagem há botões 👍/👎 (desligue com `FEEDBACK_BUTTONS=0`). Sem envio entre 20h e 9h (o que sair à noite
+"🔁 atualização". Sob cada mensagem há botões 👍/👎 (desligue com `FEEDBACK_BUTTONS=0`). Sem envio entre 21h e 9h (o que sair à noite
 é avaliado às 9h). Volume alvo: ~12–18 alertas/dia. Custo estimado com DeepSeek: ~US$ 1–2/mês.
 
 ## Instalar
