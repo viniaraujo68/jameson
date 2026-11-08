@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Jameson — bot de notícias em tempo real (editor-chefe de bolso).
+
+Roda de tempos em tempos (cron), pega só o que é NOVO nos feeds, pede a um LLM para escolher o que
+vale interromper o leitor agora, e manda cada notícia como uma mensagem no Telegram.
+Modelo/provedor trocáveis por variável de ambiente (Pydantic AI) — ver .env.example."""
+import argparse
+import hmac
+import html
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import feedparser
+import requests
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, ModelRetry, RunContext
+
+BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env")
+
+# ---------------------------------------------------------------- CONFIG ----
+TZ = ZoneInfo("America/Sao_Paulo")
+QUIET_HOURS = (23, 7)          # sem envio das 23h às 7h (o que sair à noite é avaliado às 7h)
+MIN_SCORE = 7                  # o modelo devolve só nota >= 7 (escala 1-10)
+ALWAYS_SCORE = 9               # nota >= 9 passa por cima do ritmo e dos tetos de categoria
+MAX_PER_RUN = 7                # teto de mensagens por execução (evita enxurrada); execuções são de hora em hora
+TOTAL_DAILY_CAP = 18           # teto diário para notas 7-8 (nota 8: +2); nota 9-10 vai até HARD_DAILY_CAP
+HARD_DAILY_CAP = 25
+DAILY_CAPS = {"Brasil": 4, "Mundo": 4, "Política": 4, "Mercado": 3, "Tecnologia": 3, "Esportes": 3}
+MORNING_ALLOWANCE = 0.3        # fração do dia já "liberada" às 7h (notícias da madrugada)
+MAX_AGE_HOURS = 14             # ignora itens mais velhos que isso
+FIRST_RUN_AGE_HOURS = 3        # no primeiro uso, só olha as últimas horas (evita flood)
+PER_SOURCE_PER_RUN = 10
+SNIPPET_CHARS = 280            # trecho enviado ao modelo (mais contexto = menos enchimento)
+MAX_ITEMS_PER_RUN = 90
+RECENT_SENT_HOURS = 24         # memória anti-repetição de assunto
+LANG_OUT = "português do Brasil"
+
+INTERESTS = """
+Briefing equilibrado entre Brasil e mundo. Priorize fatos de grande impacto:
+decisões de governo/Congresso/tribunais, eleições, conflitos e diplomacia, juros/inflação/câmbio/bolsa,
+grandes movimentos de empresas, IA e tecnologia relevante, resultados e grandes eventos esportivos.
+Ignore: celebridades, fofoca, clickbait, publieditorial, "dicas", promoções, opinião sem fato novo.
+"""
+CATEGORY_RULES = {
+    "Brasil": "fatos nacionais de impacto (governo, Congresso, STF/tribunais, segurança, saúde pública, grandes eventos). Evite: serviço (horários, como chegar, regras de prova), explicativos atemporais, colunas de opinião e notas regionais pequenas.",
+    "Mundo": "política internacional, conflitos, diplomacia, eleições, grandes acidentes/ataques e decisões que afetam o cenário global.",
+    "Política": "decisões e disputas de poder no Brasil e no exterior (eleições, Congresso, tribunais, governos); evite opinião sem fato novo.",
+    "Mercado": "SOMENTE economia e mercados: juros, inflação, câmbio, bolsa, bancos centrais, política fiscal, commodities, resultados e movimentos de grandes empresas. Sem matérias de consumo, finanças pessoais, modismos ou interesse humano.",
+    "Tecnologia": "IA, big techs, semicondutores, segurança digital, regulação e ciência/tecnologia relevantes; evite review de gadget e promoções.",
+    "Esportes": "futebol é a prioridade (Brasil e grandes competições). Outros esportes só quando for grande acontecimento: finais e decisões de torneios importantes, F1, Copa do Mundo/Olimpíadas, Grand Slams, finais da NBA/NFL, xadrez de alto nível. Evite rodadas comuns de modalidades de nicho e semifinais de torneios pouco relevantes para o Brasil.",
+}
+# (categoria, região, nome, url) — só veículos estabelecidos
+SOURCES = [
+    ("Mundo", "Global", "BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    ("Mundo", "Global", "The Guardian", "https://www.theguardian.com/world/rss"),
+    ("Mundo", "Global", "Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    ("Mundo", "Global", "NPR", "https://feeds.npr.org/1001/rss.xml"),
+    ("Mundo", "BR", "G1 Mundo", "https://g1.globo.com/rss/g1/mundo/"),
+    ("Mundo", "BR", "BBC Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml"),
+    ("Brasil", "BR", "G1", "https://g1.globo.com/rss/g1/"),
+    ("Brasil", "BR", "Folha", "https://feeds.folha.uol.com.br/emcimadahora/rss091.xml"),
+    ("Brasil", "BR", "Agência Brasil", "https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml"),
+    ("Política", "Global", "NPR Politics", "https://feeds.npr.org/1014/rss.xml"),
+    ("Política", "Global", "Guardian US Politics", "https://www.theguardian.com/us-news/us-politics/rss"),
+    ("Política", "BR", "G1 Política", "https://g1.globo.com/rss/g1/politica/"),
+    ("Política", "BR", "Folha Poder", "https://feeds.folha.uol.com.br/poder/rss091.xml"),
+    ("Mercado", "Global", "CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"),
+    ("Mercado", "Global", "BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+    ("Mercado", "Global", "MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+    ("Mercado", "BR", "Valor Econômico", "https://pox.globo.com/rss/valor"),
+    ("Mercado", "BR", "InfoMoney", "https://www.infomoney.com.br/feed/"),
+    ("Mercado", "BR", "Folha Mercado", "https://feeds.folha.uol.com.br/mercado/rss091.xml"),
+    ("Tecnologia", "Global", "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    ("Tecnologia", "Global", "The Verge", "https://www.theverge.com/rss/index.xml"),
+    ("Tecnologia", "Global", "TechCrunch", "https://techcrunch.com/feed/"),
+    ("Tecnologia", "BR", "Tecnoblog", "https://tecnoblog.net/feed/"),
+    ("Tecnologia", "BR", "G1 Tecnologia", "https://g1.globo.com/rss/g1/tecnologia/"),
+    ("Tecnologia", "BR", "Olhar Digital", "https://olhardigital.com.br/feed/"),
+    ("Esportes", "Global", "BBC Sport", "https://feeds.bbci.co.uk/sport/rss.xml"),
+    ("Esportes", "Global", "ESPN", "https://www.espn.com/espn/rss/news"),
+    ("Esportes", "BR", "ge.globo", "https://ge.globo.com/rss/ge/"),
+    ("Esportes", "BR", "Folha Esporte", "https://feeds.folha.uol.com.br/esporte/rss091.xml"),
+]
+# --------------------------------------------------------------------------
+
+STATE_FILE = BASE / "state.json"
+UA = "Mozilla/5.0 (compatible; jameson-news-bot/1.0)"
+log = logging.getLogger("jameson")
+
+
+# ---------------------------------------------------------------- modelo ----
+class Pick(BaseModel):
+    id: int = Field(description="id do item na lista")
+    categoria: str
+    titulo: str = Field(description="primeiros 40 caracteres do título original, copiados exatamente")
+    por_que: str = Field(default="", description="1 frase curta: o fato concreto e por que um leitor brasileiro precisa saber HOJE (se não consegue justificar, a nota deve ser baixa); não é enviada")
+    nota: int = Field(ge=1, le=10, description="importância para o leitor, 1-10")
+    manchete: str = Field(description="manchete curta (até 12 palavras) com verbo, só o fato principal")
+    resumo: str = Field(default="", description="1 frase de contexto que complementa a manchete sem repeti-la; vazio se não houver nada a acrescentar")
+
+    @property
+    def texto(self):
+        return f"{self.manchete}. {self.resumo}".strip() if self.resumo else self.manchete
+
+
+class Selection(BaseModel):
+    picks: list[Pick]
+
+
+def make_model():
+    """LLM_MODEL = 'provedor:modelo' (anthropic:claude-haiku-4-5, groq:..., deepseek:..., together:...,
+    fireworks:..., openrouter:...). Para qualquer API compatível com OpenAI (ex.: Synthetic), defina
+    também LLM_BASE_URL e LLM_API_KEY."""
+    spec = os.getenv("LLM_MODEL", "anthropic:claude-haiku-4-5")
+    base = os.getenv("LLM_BASE_URL")
+    if base:
+        from pydantic_ai.models.openai import OpenAIChatModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+        return OpenAIChatModel(spec.split(":", 1)[-1],
+                               provider=OpenAIProvider(base_url=base, api_key=os.environ["LLM_API_KEY"]))
+    return spec
+
+
+def norm(s):
+    return re.sub(r"\W+", "", s.lower())
+
+
+def build_instructions():
+    rules = "\n".join(f"- {c}: {r}" for c, r in CATEGORY_RULES.items())
+    return (
+        "Você é o curador de um bot de notícias em tempo real. A cada execução recebe os itens NOVOS dos feeds e "
+        "decide quais valem INTERROMPER o leitor agora.\n"
+        f"Critérios do leitor:\n{INTERESTS}\nCategorias e critério de cada uma:\n{rules}\n\n"
+        "Cada item vem como [id] [categoria|região|fonte] (idade) título — trecho. A categoria que você devolve "
+        "deve seguir o CONTEÚDO da notícia, não a seção do feed.\n"
+        "Dê a cada item uma nota de importância de 1 a 10 e DEVOLVA SOMENTE os itens com nota 7 ou mais. Se nada "
+        "merece, devolva a lista vazia — enviar pouco é melhor que enviar ruído; na maioria das execuções 0 a 2 itens "
+        "chegam a 7.\n"
+        "Escala: 9-10 = imprescindível (raro, uns 2 a 5 por dia): ataque ou tragédia com várias mortes, queda/formação "
+        "de governo ou troca de chefe de Estado, decisão de juros de banco central, grande movimento de mercado, final "
+        "ou decisão de grande torneio, avanço de enorme impacto em IA/tecnologia. 7-8 = importante e novo: um fato "
+        "concreto de impacto nacional ou global que o leitor ficaria mal-informado se perdesse hoje. 4-6 = "
+        "interessante mas não vale interromper: análises, desdobramentos menores, notas regionais, rodadas comuns, "
+        "serviço, previews de jogos e eventos, crises de países pequenos sem efeito fora deles, notícias de empresas "
+        "ou pessoas sem grande impacto. 1-3 = ruído. "
+        "Matérias analíticas, explicativas, comparativas, \"quem é\", colunas, opinião e balanços semanais NÃO são fato "
+        "novo: nota 6 ou menos, a não ser que tragam um acontecimento concreto e recente. "
+        "Seja criterioso e consistente: dê a mesma nota a notícias de peso parecido em qualquer hora do dia, sem se "
+        "preocupar com quantas já foram enviadas (o sistema controla o volume).\n"
+        "MESMA HISTÓRIA: se vários itens cobrem o mesmo fato, devolva só o melhor (um por fato). Se a história já "
+        "aparece em JÁ ENVIADAS, NÃO devolva — nem versão de outra fonte, nem atualização de número (mortos, feridos, "
+        "valores) — a menos que haja um desdobramento realmente novo e grande (ex.: renúncia, prisão, acordo, "
+        "mudança de patamar); nesse caso escreva só o fato novo.\n"
+        f"Para cada item devolvido: primeiro preencha por_que (por que o leitor precisa saber HOJE; se for só curiosidade, "
+        f"nota baixa), depois a manchete (até 12 palavras, com verbo) e, se houver, uma frase de contexto que NÃO repete a "
+        f"manchete (deixe o resumo vazio se não houver nada novo a acrescentar), em {LANG_OUT}, usando "
+        "SOMENTE o que está escrito no título e no trecho daquele item. NÃO use conhecimento próprio nem informação de "
+        "outros itens: não acrescente nomes, cargos, títulos (ex.: \"presidente\", \"senador\", \"ex-\"), datas, causas, "
+        "consequências, contexto, qualificativos (principal, maior, rival, recorde...) nem frases genéricas de "
+        "enchimento (ex.: \"a crise envolve a Justiça e o sistema financeiro\"). Se o título ou o trecho não dizem o "
+        "cargo de alguém, cite só o nome. Se o trecho termina cortado, NÃO complete nem deduza o que faltou: escreva "
+        "só o que é certo. Se o item é opinião ou análise, não o devolva. Mantenha o grau de certeza e o tempo verbal da fonte (\"busca restringir\" não é \"restringe\"; \"supostamente\" continua suposto). Rótulos como VÍDEO, FOTOS, AO VIVO ou EXCLUSIVO no título não são fonte da informação: ignore-os. Abra pelo fato principal e inclua o país/cargo/nome-chave que o título ou o trecho trazem. "
+        "Escreva a notícia direto, como uma manchete de telejornal: NUNCA cite o veículo (\"segundo o G1\") — a fonte já aparece no link — e NUNCA use \"segundo o título\", \"a "
+        "matéria/reportagem explica\", \"foi anunciado que\" nem metalinguagem sobre o texto-fonte; comece pelo fato."
+    )
+
+
+def build_items_listing(items, now=None):
+    now = now or datetime.now(timezone.utc)
+
+    def age(it):
+        if not it.get("time"):
+            return "?"
+        h = (now - it["time"]).total_seconds() / 3600
+        return f"{h:.0f}h" if h >= 1 else "<1h"
+
+    listing = "\n".join(
+        f"[{i}] [{it['category']}|{it['region']}|{it['source']}] ({age(it)}) {it['title']} — {it['snippet']}"
+        for i, it in enumerate(items)
+    )
+    return listing
+
+
+def recent_line(title, resumo=""):
+    return f"{title} — {resumo}" if resumo else title
+
+
+def build_user_prompt(items, recent_sent, now=None):
+    sent = "\n".join(f"- {t}" for t in recent_sent) or "(nenhuma)"
+    return (f"JÁ ENVIADAS NAS ÚLTIMAS {RECENT_SENT_HOURS}H:\n{sent}\n\n"
+            f"ITENS NOVOS:\n{build_items_listing(items, now)}")
+
+
+def entities(text):
+    """Nomes próprios aproximados (palavras capitalizadas no meio da frase, sem acento/caixa)."""
+    words = re.findall(r"\b[\wÀ-ÿ'-]+\b", text)
+    out = set()
+    for i, w in enumerate(words):
+        if len(w) >= 4 and w[0].isupper() and i > 0 and not re.search(r"[.!?:]\s*$", " ".join(words[:i])):
+            out.add(norm(unicodedata.normalize("NFKD", w).encode("ascii", "ignore").decode()))
+    return out
+
+
+def is_repeat(resumo, previous):
+    """Quase-cópia de algo já enviado (mesma notícia de outra fonte)? Conservador de propósito: só >= 5 nomes
+    próprios em comum cobrindo >= 70% do menor conjunto. Desdobramentos de uma história (ex.: novas etapas de
+    uma crise) passam; quem decide se algo é fato novo é o modelo, que vê os resumos já enviados."""
+    e = entities(resumo)
+    for prev in previous:
+        pe = entities(prev)
+        common = len(e & pe)
+        if common >= 5 and common >= 0.7 * min(len(e), len(pe)):
+            return True
+    return False
+
+
+def drop_repeats(picks, recent_texts):
+    """Descarta picks (nota < ALWAYS_SCORE) que repetem a história de algo já enviado ou de um pick melhor desta execução."""
+    kept = []
+    for p in sorted(picks, key=lambda p: -p.nota):
+        if p.nota < ALWAYS_SCORE and is_repeat(p.texto, list(recent_texts) + [k.texto for k in kept]):
+            continue
+        kept.append(p)
+    return kept
+
+
+def validate_selection(items):
+    """Checa id, categoria e se o título copiado bate com o item; se não, o Pydantic AI pede para o modelo corrigir."""
+    def check(out: Selection) -> Selection:
+        errs = []
+        for p in out.picks:
+            if not 0 <= p.id < len(items):
+                errs.append(f"id {p.id} não existe (0..{len(items)-1})")
+            elif p.categoria not in CATEGORY_RULES:
+                errs.append(f"categoria '{p.categoria}' inválida; use uma de {list(CATEGORY_RULES)}")
+            elif norm(p.titulo)[:25] not in norm(items[p.id]["title"]):
+                errs.append(f"id {p.id}: o título copiado não bate com o item [{p.id}] da lista")
+        if errs:
+            raise ModelRetry("Corrija: " + "; ".join(errs))
+        return out
+    return check
+
+
+def select_news(items, recent_sent, model=None):
+    # LLM_THINKING: "off" desliga o raciocínio (mais barato/rápido); "low"/"medium"/"high" ajusta; vazio = padrão do modelo
+    think = os.getenv("LLM_THINKING", "").strip().lower()
+    settings = {"thinking": False if think == "off" else think} if think else None
+    agent = Agent(model or make_model(), output_type=Selection, instructions=build_instructions(),
+                  retries=2, model_settings=settings)
+    agent.output_validator(validate_selection(items))
+    result = agent.run_sync(build_user_prompt(items, recent_sent))
+    u = result.usage  # propriedade no pydantic-ai >= 2
+    log.info("LLM: in=%s out=%s tokens, %d picks", u.input_tokens, u.output_tokens, len(result.output.picks))
+    return result.output.picks
+
+
+# ---------------------------------------------------------------- coleta ----
+def parse_time(entry):
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    return datetime(*t[:6], tzinfo=timezone.utc) if t else None
+
+
+def clean(text, n):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(text or ""))).strip()[:n]
+
+
+def fetch(cat, region, name, url, cutoff):
+    try:
+        d = feedparser.parse(url, agent=UA)
+    except Exception as ex:
+        log.warning("%s falhou: %s", name, ex)
+        return []
+    if not d.entries:
+        log.warning("%s: feed vazio (http=%s)", name, d.get("status"))
+    out = []
+    for e in d.entries:
+        t = parse_time(e)
+        if t and t < cutoff:
+            continue
+        out.append({"category": cat, "region": region, "source": name, "title": clean(e.get("title"), 200),
+                    "url": e.get("link", ""), "snippet": clean(e.get("summary"), SNIPPET_CHARS), "time": t})
+    out.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return out[:PER_SOURCE_PER_RUN]
+
+
+def collect_new(seen, max_age_hours):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    items, urls, titles = [], set(), set()
+    for src in SOURCES:
+        for it in fetch(*src, cutoff):
+            tkey = norm(it["title"])[:60]
+            if not it["url"] or not it["title"] or it["url"] in seen or it["url"] in urls or tkey in titles:
+                continue
+            urls.add(it["url"]); titles.add(tkey)
+            items.append(it)
+        time.sleep(0.2)
+    items.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    log.info("%d itens novos", len(items))
+    return items[:MAX_ITEMS_PER_RUN]
+
+
+# ---------------------------------------------------------------- estado ----
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"seen": {}, "sent": [], "daily": {}, "last_error_alert": 0, "initialized": False}
+
+
+def save_state(st):
+    now = time.time()
+    st["seen"] = {u: ts for u, ts in st["seen"].items() if ts > now - 7 * 86400}
+    st["sent"] = [s for s in st["sent"] if s["ts"] > now - 2 * 86400]
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False))
+    tmp.replace(STATE_FILE)
+
+
+def in_quiet_hours(now_local):
+    a, b = QUIET_HOURS
+    h = now_local.hour
+    return (h >= a or h < b) if a > b else (a <= h < b)
+
+
+def day_fraction(now_local):
+    """0..1: quanto do período ativo do dia (entre o fim e o início do silêncio) já passou."""
+    start, end = QUIET_HOURS[1], QUIET_HOURS[0]
+    frac = (now_local.hour + now_local.minute / 60 - start) / (end - start)
+    return min(1.0, max(MORNING_ALLOWANCE, frac))  # piso: a 1ª execução do dia carrega as notícias da madrugada
+
+
+def apply_policy(picks, items, daily, day_frac=1.0):
+    """Controle de volume feito em código (o modelo só dá a nota):
+    - nota >= ALWAYS_SCORE (9-10): passa sempre (até o teto duro);
+    - nota 7-8: cada categoria tem um orçamento que cresce ao longo do dia (ritmo = teto x fração do dia + 1),
+      para nenhuma categoria (ex.: Mundo) gastar tudo cedo e para sobrar espaço a notícias que chegam depois.
+      A nota 8 tem folga extra (+2 no ritmo, +3 no teto da categoria).
+    Devolve (enviar, adiar)."""
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    ranked = sorted(picks, key=lambda p: (-p.nota, items[p.id].get("time") or epoch))
+    send, defer = [], []
+    count, total = dict(daily.get("count", {})), daily.get("total", 0)
+    for p in ranked:
+        if p.nota < MIN_SCORE:
+            continue
+        if p.nota >= ALWAYS_SCORE:
+            if total >= HARD_DAILY_CAP:
+                continue
+        else:
+            bonus = p.nota - MIN_SCORE
+            cap = DAILY_CAPS[p.categoria]
+            limit = min(math.ceil(cap * day_frac) + 1 + 2 * bonus, cap + 3 * bonus)
+            if count.get(p.categoria, 0) >= limit or total >= TOTAL_DAILY_CAP + 2 * bonus:
+                continue                  # fora do orçamento: descarta de vez
+        if len(send) >= MAX_PER_RUN:
+            defer.append(p)               # fica pra próxima execução
+            continue
+        send.append(p)
+        count[p.categoria] = count.get(p.categoria, 0) + 1
+        total += 1
+    return send, defer
+
+
+# -------------------------------------------------------------- telegram ----
+def format_message(it, p):
+    alert = "🔴 " if p.nota >= ALWAYS_SCORE else ""
+    ctx = f"\n{html.escape(p.resumo)}" if p.resumo else ""
+    return (f"{alert}<b>{html.escape(p.categoria)}</b>\n<b>{html.escape(p.manchete)}</b>{ctx}\n"
+            f"<a href=\"{html.escape(it['url'], quote=True)}\">{html.escape(it['source'])}</a>")
+
+
+def tg(method, **payload):
+    r = requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}", json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def send_telegram(text, preview=False, chat_id=None):
+    tg("sendMessage", chat_id=chat_id or os.environ["TELEGRAM_CHAT_ID"], text=text, parse_mode="HTML",
+       disable_web_page_preview=not preview)
+
+
+def recipients(st):
+    """Dono (TELEGRAM_CHAT_ID) + quem se cadastrou com /start CÓDIGO."""
+    return list(dict.fromkeys([str(os.environ["TELEGRAM_CHAT_ID"])] + list(st.get("subscribers", {}))))
+
+
+def process_updates(st):
+    """Lê as mensagens novas do bot: /start CÓDIGO cadastra, /parar descadastra. Código em INVITE_CODE (.env);
+    sem ele, ninguém além do dono consegue se cadastrar."""
+    code = os.getenv("INVITE_CODE", "").strip()
+    owner = str(os.environ["TELEGRAM_CHAT_ID"])
+    subs = st.setdefault("subscribers", {})
+    for u in tg("getUpdates", offset=st.get("tg_offset", 0), timeout=0, allowed_updates=["message"]).get("result", []):
+        st["tg_offset"] = u["update_id"] + 1
+        m = u.get("message") or {}
+        chat, text = m.get("chat", {}), (m.get("text") or "").strip()
+        if chat.get("type") != "private" or not text.startswith("/"):
+            continue
+        cid = str(chat["id"])
+        cmd, _, arg = text.partition(" ")
+        cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+        if cmd == "/start":
+            if cid == owner or cid in subs:
+                reply = "Você já está inscrito. Mande /parar para sair."
+            elif code and hmac.compare_digest(arg.encode(), code.encode()):
+                subs[cid] = {"name": chat.get("first_name", ""), "since": time.time()}
+                reply = "Pronto, você está inscrito! Vou mandar as notícias que importam, uma por mensagem. /parar para sair."
+                log.info("novo assinante: %s (%s)", cid, chat.get("first_name", ""))
+            else:
+                reply = "Este bot é privado. Para entrar, mande: /start SEU_CÓDIGO"
+        elif cmd in ("/parar", "/stop"):
+            if subs.pop(cid, None) is not None:
+                reply = "Cancelado. Para voltar, mande /start SEU_CÓDIGO."
+                log.info("assinante saiu: %s", cid)
+            else:
+                continue
+        else:
+            continue
+        try:
+            send_telegram(reply, chat_id=cid)
+        except requests.RequestException as ex:
+            log.warning("resposta a %s falhou: %s", cid, ex)
+
+
+def broadcast(msg, st):
+    """Envia para todos; quem bloqueou o bot (403) ou não existe mais (400) sai da lista. Falha do dono propaga."""
+    owner = str(os.environ["TELEGRAM_CHAT_ID"])
+    for cid in recipients(st):
+        try:
+            send_telegram(msg, chat_id=cid)
+        except requests.HTTPError as ex:
+            if cid == owner:
+                raise
+            if ex.response is not None and ex.response.status_code in (400, 403):
+                st.get("subscribers", {}).pop(cid, None)
+                log.info("assinante %s removido (%s)", cid, ex.response.status_code)
+            else:
+                log.warning("envio a %s falhou: %s", cid, ex)
+
+
+# ------------------------------------------------------------------ main ----
+def run(dry=False, force=False, model=None):
+    st = load_state()
+    now_local = datetime.now(TZ)
+    if in_quiet_hours(now_local) and not force:
+        log.info("Horário de silêncio (%s). Nada a fazer.", now_local.strftime("%H:%M"))
+        return []
+    if not dry:
+        try:
+            process_updates(st)
+        except requests.RequestException as ex:
+            log.warning("cadastro: %s", ex)
+    today = now_local.strftime("%Y-%m-%d")
+    if st["daily"].get("date") != today:
+        st["daily"] = {"date": today, "count": {}, "total": 0}
+
+    first = not st.get("initialized")
+    items = collect_new(st["seen"], FIRST_RUN_AGE_HOURS if first else MAX_AGE_HOURS)
+    if not items:
+        st["initialized"] = True
+        if not dry: save_state(st)
+        return []
+    recent = [recent_line(s["title"], s.get("resumo", "")) for s in st["sent"] if s["ts"] > time.time() - RECENT_SENT_HOURS * 3600][-40:]
+    picks = drop_repeats(select_news(items, recent, model), recent)
+    send, defer = apply_policy(picks, items, st["daily"], day_fraction(now_local))
+
+    sent_msgs = []
+    for p in send:
+        it = items[p.id]
+        msg = format_message(it, p)
+        sent_msgs.append(msg)
+        if dry:
+            continue
+        broadcast(msg, st)
+        time.sleep(1)                      # limite do Telegram: ~1 msg/s por chat
+        st["sent"].append({"title": it["title"], "resumo": p.texto, "url": it["url"], "ts": time.time()})
+        st["daily"]["count"][p.categoria] = st["daily"]["count"].get(p.categoria, 0) + 1
+        st["daily"]["total"] += 1
+    if not dry:
+        deferred_ids = {p.id for p in defer}
+        now = time.time()
+        for i, it in enumerate(items):    # tudo que foi avaliado vira "visto", menos o que ficou adiado
+            if i not in deferred_ids:
+                st["seen"][it["url"]] = now
+        st["initialized"] = True
+        save_state(st)
+    log.info("avaliados=%d escolhidos=%d enviados=%d adiados=%d", len(items), len(picks), len(send), len(defer))
+    return sent_msgs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="imprime em vez de enviar; não grava estado")
+    ap.add_argument("--force", action="store_true", help="ignora horário de silêncio")
+    ap.add_argument("--register", action="store_true", help="só processa /start e /parar (sem LLM); rode a cada minuto")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.register:
+        st = load_state()
+        process_updates(st)
+        save_state(st)
+        return
+    try:
+        msgs = run(dry=args.dry_run, force=args.force)
+        if args.dry_run:
+            for m in msgs:
+                print(re.sub(r'<a href="([^"]+)">([^<]+)</a>', r"[\2](\1)", re.sub(r"</?b>", "**", m)), "\n")
+    except Exception as ex:
+        log.exception("Falha no bot")
+        st = load_state()
+        if not args.dry_run and time.time() - st.get("last_error_alert", 0) > 6 * 3600:  # no máx. 1 alerta / 6h
+            try:
+                send_telegram(f"⚠️ Jameson falhou: {html.escape(str(ex))[:400]}")
+                st["last_error_alert"] = time.time(); save_state(st)
+            except Exception:
+                pass
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
