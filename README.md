@@ -21,12 +21,12 @@ Bot do Telegram: crie com o @BotFather (token) e pegue o chat id: mande uma mens
     ./venv/bin/python bot.py --force              # envio real (1º uso: só olha as últimas 3 h)
 
 ## Cron (de hora em hora; `flock` impede execuções sobrepostas)
-    0 * * * * cd /home/SEU_USER/jameson && flock -n /tmp/jameson.lock ./venv/bin/python bot.py >> bot.log 2>&1
+    0 * * * * cd /home/SEU_USER/jameson && flock -n /tmp/jameson.lock ./venv/bin/python bot.py > /dev/null 2>> cron-error.log
 
 Cadastro de outras pessoas (opcional): defina `INVITE_CODE` no `.env`; quem mandar `/start <código>` ao bot passa a
 receber os alertas, `/parar` sai. Por padrão o cadastro responde na próxima execução (até 1 h). Para responder em ~1 min (sem chamar o LLM), adicione ao cron:
 
-    * * * * * cd /home/SEU_USER/jameson && flock -n /tmp/jameson.lock ./venv/bin/python bot.py --register >> bot.log 2>&1
+    * * * * * cd /home/SEU_USER/jameson && flock -n /tmp/jameson.lock ./venv/bin/python bot.py --register > /dev/null 2>> cron-error.log
 
 Sem `INVITE_CODE`, só o dono (`TELEGRAM_CHAT_ID`) recebe. Assinantes ficam em `state.json`.
 
@@ -35,7 +35,7 @@ O horário de silêncio usa America/Sao_Paulo, independente do fuso da VPS.
 ## Subir na VPS
     git clone/scp para ~/jameson, instalar (acima), preencher o .env, testar com --dry-run --force
     ./venv/bin/python bot.py --force   # 1ª execução real; depois deixe o cron cuidar
-    tail -f bot.log                    # acompanhar; cada execução loga tokens usados e itens enviados
+    tail -f bot.log                    # acompanhar (rotação automática: 1 MB x 3); cada execução loga tokens usados e itens enviados
 
 ## Trocar de modelo/provedor
 Só `.env` (`LLM_MODEL=provedor:modelo` + a chave do provedor). Sem mudar código.

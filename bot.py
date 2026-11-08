@@ -275,21 +275,37 @@ def clean(text, n):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(text or ""))).strip()[:n]
 
 
+JUNK_TITLE = re.compile(r"(?i)horóscopo|mega-sena|lotofácil|\bquina\b|loteria|cupom|promoç|\bofertas?\b|onde assistir|palpites?|"
+                        r"globoesporte\.com\s*$|\bao vivo\s*-")
+
+
+def make_snippet(title, summary):
+    text = clean(summary, 2000)
+    if text.lower().startswith(title.lower()):          # G1 etc. repetem o título no começo do resumo
+        text = text[len(title):].lstrip(" .:-—")
+    return text[:SNIPPET_CHARS]
+
+
 def fetch(cat, region, name, url, cutoff):
     try:
-        d = feedparser.parse(url, agent=UA)
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)   # feedparser sozinho não tem timeout
+        r.raise_for_status()
+        d = feedparser.parse(r.content)
     except Exception as ex:
         log.warning("%s falhou: %s", name, ex)
         return []
     if not d.entries:
-        log.warning("%s: feed vazio (http=%s)", name, d.get("status"))
+        log.warning("%s: feed vazio", name)
     out = []
     for e in d.entries:
         t = parse_time(e)
         if t and t < cutoff:
             continue
-        out.append({"category": cat, "region": region, "source": name, "title": clean(e.get("title"), 200),
-                    "url": e.get("link", ""), "snippet": clean(e.get("summary"), SNIPPET_CHARS), "time": t})
+        title = clean(e.get("title"), 200)
+        if JUNK_TITLE.search(title):
+            continue
+        out.append({"category": cat, "region": region, "source": name, "title": title,
+                    "url": e.get("link", ""), "snippet": make_snippet(title, e.get("summary")), "time": t})
     out.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return out[:PER_SOURCE_PER_RUN]
 
@@ -476,6 +492,14 @@ def run(dry=False, force=False, model=None):
     picks = drop_repeats(select_news(items, recent, model), recent)
     send, defer = apply_policy(picks, items, st["daily"], day_fraction(now_local))
 
+    if not dry:                            # diário de decisões: base para calibrar notas com dados reais
+        sent_ids = {p.id for p in send}
+        with open(BASE / "picks.jsonl", "a", encoding="utf-8") as f:
+            for p in picks:
+                f.write(json.dumps({"ts": int(time.time()), "fonte": items[p.id]["source"], "categoria": p.categoria,
+                                    "nota": p.nota, "enviada": p.id in sent_ids, "adiada": p in defer,
+                                    "manchete": p.manchete, "url": items[p.id]["url"]}, ensure_ascii=False) + "\n")
+
     sent_msgs = []
     for p in send:
         it = items[p.id]
@@ -488,6 +512,7 @@ def run(dry=False, force=False, model=None):
         st["sent"].append({"title": it["title"], "resumo": p.texto, "url": it["url"], "ts": time.time()})
         st["daily"]["count"][p.categoria] = st["daily"]["count"].get(p.categoria, 0) + 1
         st["daily"]["total"] += 1
+        save_state(st)                     # a cada envio: se cair no meio, não reenvia ao recomeçar
     if not dry:
         deferred_ids = {p.id for p in defer}
         now = time.time()
@@ -506,7 +531,10 @@ def main():
     ap.add_argument("--force", action="store_true", help="ignora horário de silêncio")
     ap.add_argument("--register", action="store_true", help="só processa /start e /parar (sem LLM); rode a cada minuto")
     args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    from logging.handlers import RotatingFileHandler
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(),
+                                  RotatingFileHandler(BASE / "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")])
     if args.register:
         st = load_state()
         process_updates(st)
