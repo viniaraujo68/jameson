@@ -5,6 +5,8 @@ Roda de tempos em tempos (cron), pega só o que é NOVO nos feeds, pede a um LLM
 vale interromper o leitor agora, e manda cada notícia como uma mensagem no Telegram.
 Modelo/provedor trocáveis por variável de ambiente (Pydantic AI) — ver .env.example."""
 import argparse
+import concurrent.futures
+import hashlib
 import hmac
 import html
 import json
@@ -40,10 +42,12 @@ DAILY_CAPS = {"Brasil": 4, "Mundo": 4, "Política": 4, "Mercado": 3, "Tecnologia
 MORNING_ALLOWANCE = 0.3        # fração do dia já "liberada" às 7h (notícias da madrugada)
 MAX_AGE_HOURS = 14             # ignora itens mais velhos que isso
 FIRST_RUN_AGE_HOURS = 3        # no primeiro uso, só olha as últimas horas (evita flood)
-PER_SOURCE_PER_RUN = 10
+PER_SOURCE_PER_RUN = 8
 SNIPPET_CHARS = 280            # trecho enviado ao modelo (mais contexto = menos enchimento)
-MAX_ITEMS_PER_RUN = 90
+MAX_ITEMS_PER_RUN = 140
 RECENT_SENT_HOURS = 24         # memória anti-repetição de assunto
+FEEDBACK_BUTTONS = os.getenv("FEEDBACK_BUTTONS", "1") != "0"   # botões 👍/👎 sob cada mensagem
+ARTICLE_CHARS = 2500           # quanto da matéria o redator lê
 LANG_OUT = "português do Brasil"
 
 INTERESTS = """
@@ -67,26 +71,36 @@ SOURCES = [
     ("Mundo", "Global", "Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
     ("Mundo", "Global", "NPR", "https://feeds.npr.org/1001/rss.xml"),
     ("Mundo", "BR", "G1 Mundo", "https://g1.globo.com/rss/g1/mundo/"),
+    ("Mundo", "Global", "NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
     ("Mundo", "BR", "BBC Brasil", "https://feeds.bbci.co.uk/portuguese/rss.xml"),
+    ("Mundo", "BR", "DW Brasil", "https://rss.dw.com/rdf/rss-br-all"),
     ("Brasil", "BR", "G1", "https://g1.globo.com/rss/g1/"),
     ("Brasil", "BR", "Folha", "https://feeds.folha.uol.com.br/emcimadahora/rss091.xml"),
     ("Brasil", "BR", "Agência Brasil", "https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml"),
+    ("Brasil", "BR", "CNN Brasil", "https://www.cnnbrasil.com.br/feed/"),
     ("Política", "Global", "NPR Politics", "https://feeds.npr.org/1014/rss.xml"),
     ("Política", "Global", "Guardian US Politics", "https://www.theguardian.com/us-news/us-politics/rss"),
     ("Política", "BR", "G1 Política", "https://g1.globo.com/rss/g1/politica/"),
     ("Política", "BR", "Folha Poder", "https://feeds.folha.uol.com.br/poder/rss091.xml"),
+    ("Política", "BR", "Poder360", "https://www.poder360.com.br/feed/"),
+    ("Política", "Global", "Washington Post", "https://feeds.washingtonpost.com/rss/world"),
     ("Mercado", "Global", "CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"),
     ("Mercado", "Global", "BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
     ("Mercado", "Global", "MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
     ("Mercado", "BR", "Valor Econômico", "https://pox.globo.com/rss/valor"),
     ("Mercado", "BR", "InfoMoney", "https://www.infomoney.com.br/feed/"),
     ("Mercado", "BR", "Folha Mercado", "https://feeds.folha.uol.com.br/mercado/rss091.xml"),
+    ("Mercado", "BR", "Exame", "https://exame.com/feed/"),
+    ("Mercado", "BR", "Money Times", "https://www.moneytimes.com.br/feed/"),
+    ("Mercado", "Global", "NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"),
+    ("Mercado", "Global", "Financial Times", "https://www.ft.com/rss/home"),
     ("Tecnologia", "Global", "Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
     ("Tecnologia", "Global", "The Verge", "https://www.theverge.com/rss/index.xml"),
     ("Tecnologia", "Global", "TechCrunch", "https://techcrunch.com/feed/"),
     ("Tecnologia", "BR", "Tecnoblog", "https://tecnoblog.net/feed/"),
     ("Tecnologia", "BR", "G1 Tecnologia", "https://g1.globo.com/rss/g1/tecnologia/"),
     ("Tecnologia", "BR", "Olhar Digital", "https://olhardigital.com.br/feed/"),
+    ("Tecnologia", "BR", "Canaltech", "https://canaltech.com.br/rss/"),
     ("Esportes", "Global", "BBC Sport", "https://feeds.bbci.co.uk/sport/rss.xml"),
     ("Esportes", "Global", "ESPN", "https://www.espn.com/espn/rss/news"),
     ("Esportes", "BR", "ge.globo", "https://ge.globo.com/rss/ge/"),
@@ -108,6 +122,8 @@ class Pick(BaseModel):
     nota: int = Field(ge=1, le=10, description="importância para o leitor, 1-10")
     manchete: str = Field(description="manchete curta (até 12 palavras) com verbo, só o fato principal")
     resumo: str = Field(default="", description="1 frase de contexto que complementa a manchete sem repeti-la; vazio se não houver nada a acrescentar")
+
+    atualizacao: bool = Field(default=False, description="true se for desdobramento novo de uma história que já aparece em JÁ ENVIADAS")
 
     @property
     def texto(self):
@@ -161,7 +177,7 @@ def build_instructions():
         "MESMA HISTÓRIA: se vários itens cobrem o mesmo fato, devolva só o melhor (um por fato). Se a história já "
         "aparece em JÁ ENVIADAS, NÃO devolva — nem versão de outra fonte, nem atualização de número (mortos, feridos, "
         "valores) — a menos que haja um desdobramento realmente novo e grande (ex.: renúncia, prisão, acordo, "
-        "mudança de patamar); nesse caso escreva só o fato novo.\n"
+        "mudança de patamar); nesse caso marque atualizacao=true e escreva só o fato novo.\n"
         f"Para cada item devolvido: primeiro preencha por_que (por que o leitor precisa saber HOJE; se for só curiosidade, "
         f"nota baixa), depois a manchete (até 12 palavras, com verbo) e, se houver, uma frase de contexto que NÃO repete a "
         f"manchete (deixe o resumo vazio se não houver nada novo a acrescentar), em {LANG_OUT}, usando "
@@ -200,6 +216,84 @@ def build_user_prompt(items, recent_sent, now=None):
     sent = "\n".join(f"- {t}" for t in recent_sent) or "(nenhuma)"
     return (f"JÁ ENVIADAS NAS ÚLTIMAS {RECENT_SENT_HOURS}H:\n{sent}\n\n"
             f"ITENS NOVOS:\n{build_items_listing(items, now)}")
+
+
+REWRITE_INSTRUCTIONS = (
+    f"Você é o redator de um bot de notícias. Para cada item recebe: título, trecho do feed, um RASCUNHO de manchete e "
+    f"contexto, e o TEXTO DA MATÉRIA. Reescreva manchete e contexto em {LANG_OUT} usando SOMENTE o que está no texto da "
+    "matéria, no trecho ou no título. Manchete: até 12 palavras, com verbo, o fato principal (quem fez o quê). "
+    "Contexto: 1 a 2 frases curtas que ACRESCENTAM o que o leitor precisa para entender sem conhecimento prévio — quem é "
+    "a pessoa ou empresa (cargo, nacionalidade), onde, o motivo ou a consequência, números relevantes. Se o texto da "
+    "matéria trouxer detalhe que corrija o rascunho, siga o texto. NUNCA cite o veículo (\"segundo o G1\"), nunca use "
+    "metatexto (\"não identificado no trecho\", \"a matéria diz\"), não invente, não use conhecimento próprio, não "
+    "interprete nem dê juízo de valor. Mantenha o grau de certeza e o tempo verbal da fonte. Devolva um item por id."
+)
+
+
+class Rewrite(BaseModel):
+    id: int
+    manchete: str
+    resumo: str = ""
+
+
+class Rewrites(BaseModel):
+    items: list[Rewrite]
+
+
+def fetch_article(url):
+    """Texto da matéria (og:description + primeiros parágrafos). Vazio se bloqueada/paywall/erro."""
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=10)
+        r.raise_for_status()
+        if "html" not in r.headers.get("content-type", "html"):
+            return ""
+        page = r.text[:600_000]
+    except Exception:
+        return ""
+    junk = re.compile(r"(?i)cookie|assine|newsletter|todos os direitos|leia também|leia mais|publicidade|advertisement|subscribe|sign up")
+    paras = [clean(m, 700) for m in re.findall(r"<p[^>]*>(.*?)</p>", page, re.S | re.I)]
+    paras = [p for p in paras if len(p) >= 60 and not junk.search(p)]
+    og = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]+content=["\']([^"\']+)', page, re.I)
+    text = " ".join(([clean(og.group(1), 400)] if og else []) + paras)
+    return text[:ARTICLE_CHARS]
+
+
+def enrich(send, items, model=None):
+    """2º passo: só para quem vai ser enviado, lê a matéria e reescreve manchete/contexto com o texto completo."""
+    if not send:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        texts = list(ex.map(lambda p: fetch_article(items[p.id]["url"]), send))
+    todo = [(p, t) for p, t in zip(send, texts) if len(t) >= 300]
+    if not todo:
+        log.info("redator: nenhuma matéria legível; mantendo rascunhos")
+        return
+    blocks = []
+    for p, t in todo:
+        it = items[p.id]
+        blocks.append(f"[{p.id}] TÍTULO: {it['title']}\nTRECHO DO FEED: {it['snippet']}\n"
+                      f"RASCUNHO: {p.manchete}. {p.resumo}\nTEXTO DA MATÉRIA: {t}")
+    think = os.getenv("LLM_THINKING", "").strip().lower()
+    settings = {"thinking": False if think == "off" else think} if think else None
+    agent = Agent(model or make_model(), output_type=Rewrites, instructions=REWRITE_INSTRUCTIONS, retries=2,
+                  model_settings=settings)
+    allowed = {p.id for p, _ in todo}
+
+    @agent.output_validator
+    def _check(out: Rewrites) -> Rewrites:
+        bad = [r.id for r in out.items if r.id not in allowed]
+        if bad:
+            raise ModelRetry(f"ids inválidos {bad}; use só {sorted(allowed)}")
+        return out
+
+    result = agent.run_sync("\n\n".join(blocks))
+    u = result.usage
+    log.info("redator: in=%s out=%s tokens, %d matérias lidas", u.input_tokens, u.output_tokens, len(todo))
+    by_id = {r.id: r for r in result.output.items}
+    for p, _ in todo:
+        r = by_id.get(p.id)
+        if r and r.manchete.strip():
+            p.manchete, p.resumo = r.manchete.strip(), r.resumo.strip()
 
 
 def entities(text):
@@ -338,6 +432,7 @@ def save_state(st):
     now = time.time()
     st["seen"] = {u: ts for u, ts in st["seen"].items() if ts > now - 7 * 86400}
     st["sent"] = [s for s in st["sent"] if s["ts"] > now - 2 * 86400]
+    st["meta"] = {h: m for h, m in st.get("meta", {}).items() if m.get("ts", 0) > now - 30 * 86400}
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False))
     tmp.replace(STATE_FILE)
@@ -392,7 +487,8 @@ def apply_policy(picks, items, daily, day_frac=1.0):
 def format_message(it, p):
     alert = "🔴 " if p.nota >= ALWAYS_SCORE else ""
     ctx = f"\n{html.escape(p.resumo)}" if p.resumo else ""
-    return (f"{alert}<b>{html.escape(p.categoria)}</b>\n<b>{html.escape(p.manchete)}</b>{ctx}\n"
+    tag = " · 🔁 atualização" if p.atualizacao else ""
+    return (f"{alert}<b>{html.escape(p.categoria)}</b>{tag}\n<b>{html.escape(p.manchete)}</b>{ctx}\n"
             f"<a href=\"{html.escape(it['url'], quote=True)}\">{html.escape(it['source'])}</a>")
 
 
@@ -402,9 +498,37 @@ def tg(method, **payload):
     return r.json()
 
 
-def send_telegram(text, preview=False, chat_id=None):
+def send_telegram(text, preview=False, chat_id=None, markup=None):
+    extra = {"reply_markup": markup} if markup else {}
     tg("sendMessage", chat_id=chat_id or os.environ["TELEGRAM_CHAT_ID"], text=text, parse_mode="HTML",
-       disable_web_page_preview=not preview)
+       disable_web_page_preview=not preview, **extra)
+
+
+def url_hash(url):
+    return hashlib.sha1(url.encode()).hexdigest()[:10]
+
+
+def feedback_markup(h):
+    return {"inline_keyboard": [[{"text": "👍", "callback_data": f"v1:{h}"}, {"text": "👎", "callback_data": f"v0:{h}"}]]}
+
+
+def handle_vote(st, cq):
+    """Registra 👍/👎 em feedback.jsonl (base para calibrar o prompt) e troca os botões por uma confirmação."""
+    data = cq.get("data", "")
+    msg = cq.get("message") or {}
+    try:
+        if data.startswith(("v1:", "v0:")):
+            vote, h = int(data[1]), data[3:]
+            meta = st.get("meta", {}).get(h, {})
+            with open(BASE / "feedback.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({**meta, "ts_envio": meta.get("ts"), "ts": int(time.time()),
+                                    "chat": msg.get("chat", {}).get("id"), "voto": vote}, ensure_ascii=False) + "\n")
+            label = "👍 anotado" if vote else "👎 anotado"
+            tg("editMessageReplyMarkup", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+               reply_markup={"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]})
+        tg("answerCallbackQuery", callback_query_id=cq["id"])
+    except (requests.RequestException, KeyError) as ex:
+        log.warning("voto: %s", ex)
 
 
 def recipients(st):
@@ -418,8 +542,11 @@ def process_updates(st):
     code = os.getenv("INVITE_CODE", "").strip()
     owner = str(os.environ["TELEGRAM_CHAT_ID"])
     subs = st.setdefault("subscribers", {})
-    for u in tg("getUpdates", offset=st.get("tg_offset", 0), timeout=0, allowed_updates=["message"]).get("result", []):
+    for u in tg("getUpdates", offset=st.get("tg_offset", 0), timeout=0, allowed_updates=["message", "callback_query"]).get("result", []):
         st["tg_offset"] = u["update_id"] + 1
+        if u.get("callback_query"):
+            handle_vote(st, u["callback_query"])
+            continue
         m = u.get("message") or {}
         chat, text = m.get("chat", {}), (m.get("text") or "").strip()
         if chat.get("type") != "private" or not text.startswith("/"):
@@ -450,12 +577,12 @@ def process_updates(st):
             log.warning("resposta a %s falhou: %s", cid, ex)
 
 
-def broadcast(msg, st):
+def broadcast(msg, st, markup=None):
     """Envia para todos; quem bloqueou o bot (403) ou não existe mais (400) sai da lista. Falha do dono propaga."""
     owner = str(os.environ["TELEGRAM_CHAT_ID"])
     for cid in recipients(st):
         try:
-            send_telegram(msg, chat_id=cid)
+            send_telegram(msg, chat_id=cid, markup=markup)
         except requests.HTTPError as ex:
             if cid == owner:
                 raise
@@ -491,6 +618,10 @@ def run(dry=False, force=False, model=None):
     recent = [recent_line(s["title"], s.get("resumo", "")) for s in st["sent"] if s["ts"] > time.time() - RECENT_SENT_HOURS * 3600][-40:]
     picks = drop_repeats(select_news(items, recent, model), recent)
     send, defer = apply_policy(picks, items, st["daily"], day_fraction(now_local))
+    try:
+        enrich(send, items, model)
+    except Exception as ex:                # sem redator, vale o rascunho do 1º passo
+        log.warning("redator falhou (%s); mantendo rascunhos", ex)
 
     if not dry:                            # diário de decisões: base para calibrar notas com dados reais
         sent_ids = {p.id for p in send}
@@ -507,7 +638,10 @@ def run(dry=False, force=False, model=None):
         sent_msgs.append(msg)
         if dry:
             continue
-        broadcast(msg, st)
+        h = url_hash(it["url"])
+        st.setdefault("meta", {})[h] = {"manchete": p.manchete, "url": it["url"], "categoria": p.categoria,
+                                        "nota": p.nota, "fonte": it["source"], "ts": int(time.time())}
+        broadcast(msg, st, feedback_markup(h) if FEEDBACK_BUTTONS else None)
         time.sleep(1)                      # limite do Telegram: ~1 msg/s por chat
         st["sent"].append({"title": it["title"], "resumo": p.texto, "url": it["url"], "ts": time.time()})
         st["daily"]["count"][p.categoria] = st["daily"]["count"].get(p.categoria, 0) + 1
