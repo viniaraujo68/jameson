@@ -661,6 +661,29 @@ def run(dry=False, force=False, model=None):
     return sent_msgs
 
 
+BALANCE_ALERT_USD = float(os.environ.get("BALANCE_ALERT_USD", "0.30"))  # avisa o dono quando o saldo DeepSeek cair abaixo disso
+
+
+def check_balance(st):
+    """Avisa só o dono (no máx. 1x/dia) se o saldo da DeepSeek estiver baixo. Silencioso se não usar DeepSeek."""
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key or not os.environ.get("LLM_MODEL", "").startswith("deepseek"):
+        return
+    if time.time() - st.get("last_balance_alert", 0) < 22 * 3600:
+        return
+    try:
+        r = requests.get("https://api.deepseek.com/user/balance", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+        info = r.json()["balance_infos"][0]
+        bal = float(info["total_balance"])
+        usd = bal if info.get("currency") == "USD" else bal / 7.2
+    except Exception as ex:
+        log.warning("Não consegui checar o saldo: %s", ex)
+        return
+    if usd < BALANCE_ALERT_USD:
+        send_telegram(f"⚠️ Saldo da DeepSeek baixo: ~US$ {usd:.2f} (alerta abaixo de US$ {BALANCE_ALERT_USD:.2f}). Recarregue para o Jameson não parar.")
+        st["last_balance_alert"] = time.time(); save_state(st)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="imprime em vez de enviar; não grava estado")
@@ -676,6 +699,11 @@ def main():
         process_updates(st)
         save_state(st)
         return
+    if not args.dry_run:
+        try:
+            st0 = load_state(); check_balance(st0)
+        except Exception:
+            log.exception("check_balance")
     try:
         msgs = run(dry=args.dry_run, force=args.force)
         if args.dry_run:
