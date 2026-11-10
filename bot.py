@@ -48,7 +48,7 @@ PER_SOURCE_PER_RUN = 8
 SNIPPET_CHARS = 280            # trecho enviado ao modelo (mais contexto = menos enchimento)
 MAX_ITEMS_PER_RUN = 140
 RECENT_SENT_HOURS = 24         # memória anti-repetição de assunto
-FEEDBACK_BUTTONS = os.getenv("FEEDBACK_BUTTONS", "1") != "0"   # botões 👍/👎 sob cada mensagem
+FEEDBACK_BUTTONS = os.getenv("FEEDBACK_BUTTONS", "0") == "1"   # botões 👍/👎 sob cada mensagem (desligados por padrão)
 ARTICLE_CHARS = 2500           # quanto da matéria o redator lê
 LANG_OUT = "português do Brasil"
 
@@ -636,7 +636,7 @@ def run(dry=False, force=False, model=None):
         with open(DATA / "picks.jsonl", "a", encoding="utf-8") as f:
             for p in picks:
                 f.write(json.dumps({"ts": int(time.time()), "fonte": items[p.id]["source"], "categoria": p.categoria,
-                                    "nota": p.nota, "enviada": p.id in sent_ids, "adiada": p in defer,
+                                    "nota": p.nota, "resumo": p.resumo, "enviada": p.id in sent_ids, "adiada": p in defer,
                                     "manchete": p.manchete, "url": items[p.id]["url"]}, ensure_ascii=False) + "\n")
 
     sent_msgs = []
