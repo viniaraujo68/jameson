@@ -47,5 +47,5 @@ Só `.env` (`LLM_MODEL=provedor:modelo` + a chave do provedor). Sem mudar códig
 No topo do `bot.py`: `INTERESTS`, `CATEGORY_RULES`, `SOURCES`, `DAILY_CAPS`, `QUIET_HOURS`.
 `state.json` guarda o que já foi visto/enviado (apague para recomeçar).
 
-Arquivos gerados (fora do Git): `picks.jsonl` (toda escolha do modelo, com nota e se foi enviada), `items.jsonl` (TODA notícia avaliada, escolhida ou não, para treino futuro), `feedback.jsonl`
+Arquivos gerados (fora do Git): `picks.jsonl` (toda escolha do modelo, com nota e se foi enviada), `feedback.jsonl`
 (seus 👍/👎), `bot.log` (rotativo), `cron-error.log`. Servem para calibrar o prompt com dados reais.

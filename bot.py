@@ -638,15 +638,6 @@ def run(dry=False, force=False, model=None):
                                     "nota": p.nota, "resumo": p.resumo, "enviada": p.id in sent_ids, "adiada": p in defer,
                                     "manchete": p.manchete, "url": items[p.id]["url"]}, ensure_ascii=False) + "\n")
 
-    if not dry:                            # todas as notícias avaliadas (escolhidas ou não): base para treinar um modelo local
-        nota_de = {p.id: p.nota for p in picks}
-        sent_ids = {p.id for p in send}
-        with open(DATA / "items.jsonl", "a", encoding="utf-8") as f:
-            for i, it in enumerate(items):
-                f.write(json.dumps({"ts": int(time.time()), "fonte": it["source"], "secao": it["category"], "titulo": it["title"],
-                                    "trecho": it["snippet"], "url": it["url"], "nota": nota_de.get(i, 0),
-                                    "enviada": i in sent_ids}, ensure_ascii=False) + "\n")
-
     sent_msgs = []
     for p in send:
         it = items[p.id]

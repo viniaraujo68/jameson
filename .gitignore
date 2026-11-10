@@ -6,5 +6,4 @@ __pycache__/
 state.json
 cron-error.log
 picks.jsonl
-items.jsonl
 feedback.jsonl
