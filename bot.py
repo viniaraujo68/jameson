@@ -35,10 +35,10 @@ DATA.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------- CONFIG ----
 TZ = ZoneInfo("America/Sao_Paulo")
 QUIET_HOURS = (21, 9)          # sem envio das 21h às 9h (a última rodada com envio é a das 20h)
-MIN_SCORE = 7                  # o modelo devolve só nota >= 7 (escala 1-10)
+MIN_SCORE = 8                  # o código só envia nota >= 8 (o modelo ainda devolve as 7, que ficam no picks.jsonl p/ calibrar)
 ALWAYS_SCORE = 9               # nota >= 9 passa por cima do ritmo e dos tetos de categoria
 MAX_PER_RUN = 7                # teto de mensagens por execução (evita enxurrada); execuções são de hora em hora
-TOTAL_DAILY_CAP = 18           # teto diário para notas 7-8 (nota 8: +2); nota 9-10 vai até HARD_DAILY_CAP
+TOTAL_DAILY_CAP = 18           # teto diário para notas abaixo de ALWAYS_SCORE; nota 9-10 vai até HARD_DAILY_CAP
 HARD_DAILY_CAP = 25
 DAILY_CAPS = {"Brasil": 4, "Mundo": 4, "Política": 4, "Mercado": 3, "Tecnologia": 3, "Esportes": 3}
 MORNING_ALLOWANCE = 0.3        # fração do dia já "liberada" às 9h (notícias da madrugada)
@@ -611,6 +611,10 @@ def run(dry=False, force=False, model=None):
     if st["daily"].get("date") != today:
         st["daily"] = {"date": today, "count": {}, "total": 0}
 
+    if st["daily"].get("total", 0) >= HARD_DAILY_CAP and not force:   # nada mais pode ser enviado hoje: poupa a chamada ao modelo
+        log.info("Teto diário (%d) atingido; pulando a rodada.", HARD_DAILY_CAP)
+        if not dry: save_state(st)
+        return []
     first = not st.get("initialized")
     items = collect_new(st["seen"], FIRST_RUN_AGE_HOURS if first else MAX_AGE_HOURS)
     if not items:
