@@ -488,7 +488,8 @@ def format_message(it, p):
 
 def tg(method, **payload):
     r = requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}", json=payload, timeout=20)
-    r.raise_for_status()
+    if not r.ok:   # sem a URL na mensagem (ela contém o token do bot)
+        raise requests.HTTPError(f"Telegram {method}: {r.status_code} {r.text[:200]}")
     return r.json()
 
 
@@ -514,12 +515,19 @@ def handle_vote(st, cq):
         if data.startswith(("v1:", "v0:")):
             vote, h = int(data[1]), data[3:]
             meta = st.get("meta", {}).get(h, {})
-            with open(DATA / "feedback.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps({**meta, "ts_envio": meta.get("ts"), "ts": int(time.time()),
-                                    "chat": msg.get("chat", {}).get("id"), "voto": vote}, ensure_ascii=False) + "\n")
+            vkey = f"{msg.get('chat', {}).get('id')}:{msg.get('message_id')}"
+            voted = st.setdefault("voted", [])
+            if vkey not in voted:          # clique repetido na mesma mensagem não conta duas vezes
+                voted.append(vkey); del voted[:-500]
+                with open(DATA / "feedback.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({**meta, "ts_envio": meta.get("ts"), "ts": int(time.time()),
+                                        "chat": msg.get("chat", {}).get("id"), "voto": vote}, ensure_ascii=False) + "\n")
             label = "👍 anotado" if vote else "👎 anotado"
-            tg("editMessageReplyMarkup", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
-               reply_markup={"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]})
+            try:
+                tg("editMessageReplyMarkup", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+                   reply_markup={"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]})
+            except requests.RequestException as ex:   # ex.: "message is not modified" em clique repetido
+                log.info("botão não editado: %s", ex)
         tg("answerCallbackQuery", callback_query_id=cq["id"])
     except (requests.RequestException, KeyError) as ex:
         log.warning("voto: %s", ex)
