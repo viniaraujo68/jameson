@@ -47,7 +47,8 @@ FIRST_RUN_AGE_HOURS = 3        # no primeiro uso, só olha as últimas horas (ev
 PER_SOURCE_PER_RUN = 8
 SNIPPET_CHARS = 280            # trecho enviado ao modelo (mais contexto = menos enchimento)
 MAX_ITEMS_PER_RUN = 140
-RECENT_SENT_HOURS = 24         # memória anti-repetição de assunto
+RECENT_SENT_HOURS = 48         # memória anti-repetição de assunto
+RECENT_SENT_LIMIT = 60
 FEEDBACK_BUTTONS = os.getenv("FEEDBACK_BUTTONS", "0") == "1"   # botões 👍/👎 sob cada mensagem (desligados por padrão)
 ARTICLE_CHARS = 2500           # quanto da matéria o redator lê
 LANG_OUT = "português do Brasil"
@@ -59,8 +60,8 @@ grandes movimentos de empresas, IA e tecnologia relevante, resultados e grandes 
 Ignore: celebridades, fofoca, clickbait, publieditorial, "dicas", promoções, opinião sem fato novo.
 """
 CATEGORY_RULES = {
-    "Brasil": "fatos nacionais de impacto (governo, Congresso, STF/tribunais, segurança, saúde pública, grandes eventos). Evite: serviço (horários, como chegar, regras de prova), explicativos atemporais, colunas de opinião e notas regionais pequenas.",
-    "Mundo": "política internacional, conflitos, diplomacia, eleições, grandes acidentes/ataques e decisões que afetam o cenário global.",
+    "Brasil": "fatos nacionais de impacto (governo, Congresso, STF/tribunais, segurança, saúde pública, grandes eventos). Evite: serviço (horários, como chegar, regras de prova), explicativos atemporais, colunas de opinião, notas regionais pequenas e atos processuais ou administrativos de rotina (liminares e suspensões pontuais, nomeações, votações em comissão, pedidos de arquivamento, inclusão em listas) que não mudam a situação do país.",
+    "Mundo": "política internacional, conflitos, diplomacia, eleições e decisões que afetam o cenário global. Acidentes, naufrágios, tiroteios e desastres só entram com número muito alto de vítimas ou efeito além do país; política interna de países pequenos e prisões ou processos de figuras estrangeiras sem efeito global ficam de fora.",
     "Política": "decisões e disputas de poder no Brasil e no exterior (eleições, Congresso, tribunais, governos); evite opinião sem fato novo.",
     "Mercado": "SOMENTE economia e mercados: juros, inflação, câmbio, bolsa, bancos centrais, política fiscal, commodities, resultados e movimentos de grandes empresas. Sem matérias de consumo, finanças pessoais, modismos ou interesse humano.",
     "Tecnologia": "IA, big techs, semicondutores, segurança digital, regulação e ciência/tecnologia relevantes; evite review de gadget e promoções.",
@@ -171,8 +172,13 @@ def build_instructions():
         "preocupar com quantas já foram enviadas (o sistema controla o volume).\n"
         "MESMA HISTÓRIA: se vários itens cobrem o mesmo fato, devolva só o melhor (um por fato). Se a história já "
         "aparece em JÁ ENVIADAS, NÃO devolva — nem versão de outra fonte, nem atualização de número (mortos, feridos, "
-        "valores) — a menos que haja um desdobramento realmente novo e grande (ex.: renúncia, prisão, acordo, "
-        "mudança de patamar); nesse caso marque atualizacao=true e escreva só o fato novo.\n"
+        "valores), nem reação de mercado ao mesmo fato, nem nova declaração dos mesmos personagens repetindo o que já foi "
+        "dito, nem mais um passo burocrático do mesmo caso — a menos que haja um desdobramento realmente novo e grande "
+        "(ex.: renúncia, prisão, acordo, mudança de patamar); nesse caso marque atualizacao=true e escreva só o fato novo. "
+        "Compare pelo ASSUNTO (pessoas, empresas, país, caso), não pelas palavras do título: o mesmo assunto com outro "
+        "título ou de outro veículo continua sendo a mesma história. Um dado que já estava previsto ou antecipado em JÁ "
+        "ENVIADAS não é fato novo, mas o resultado oficial de um dado antecipado (ex.: o número da inflação depois da "
+        "prévia) é.\n"
         f"Para cada item devolvido: primeiro preencha por_que (por que o leitor precisa saber HOJE; se for só curiosidade, "
         f"nota baixa), depois a manchete (até 12 palavras, com verbo) e, se houver, uma frase de contexto que NÃO repete a "
         f"manchete (deixe o resumo vazio se não houver nada novo a acrescentar), em {LANG_OUT}, usando "
@@ -366,6 +372,7 @@ def clean(text, n):
 
 JUNK_TITLE = re.compile(r"(?i)horóscopo|mega-sena|lotofácil|\bquina\b|loteria|cupom|promoç|\bofertas?\b|onde assistir|palpites?|"
                         r"globoesporte\.com\s*$|\bao vivo\s*-")
+LIVE_URL = re.compile(r"/ao-vivo/|/live/|/liveblog/")
 
 
 def make_snippet(title, summary):
@@ -391,7 +398,7 @@ def fetch(cat, region, name, url, cutoff):
         if t and t < cutoff:
             continue
         title = clean(e.get("title"), 200)
-        if JUNK_TITLE.search(title):
+        if JUNK_TITLE.search(title) or LIVE_URL.search(e.get("link", "")):
             continue
         out.append({"category": cat, "region": region, "source": name, "title": title,
                     "url": e.get("link", ""), "snippet": make_snippet(title, e.get("summary")), "time": t})
@@ -622,7 +629,7 @@ def run(dry=False, force=False, model=None):
         st["initialized"] = True
         if not dry: save_state(st)
         return []
-    recent = [recent_line(s["title"], s.get("resumo", "")) for s in st["sent"] if s["ts"] > time.time() - RECENT_SENT_HOURS * 3600][-40:]
+    recent = [recent_line(s["title"], s.get("resumo", "")) for s in st["sent"] if s["ts"] > time.time() - RECENT_SENT_HOURS * 3600][-RECENT_SENT_LIMIT:]
     picks = drop_repeats(select_news(items, recent, model), recent)
     send, defer = apply_policy(picks, items, st["daily"], day_fraction(now_local))
     try:
