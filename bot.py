@@ -98,6 +98,8 @@ SOURCES = [
     ("Tecnologia", "Global", "TechCrunch", "https://techcrunch.com/feed/"),
     ("Tecnologia", "BR", "Tecnoblog", "https://tecnoblog.net/feed/"),
     ("Esportes", "Global", "BBC Sport", "https://feeds.bbci.co.uk/sport/rss.xml"),
+    ("Esportes", "Global", "Guardian Football", "https://www.theguardian.com/football/rss"),
+    ("Esportes", "Global", "Sky Sports", "https://www.skysports.com/rss/12040"),
     ("Esportes", "BR", "ge.globo", "https://ge.globo.com/rss/ge/"),
 ]
 # --------------------------------------------------------------------------
